@@ -296,8 +296,61 @@ func TestCollectSystemMetrics(t *testing.T) {
 		}
 		// Every metric must survive the wire encoding it will actually be sent
 		// with, otherwise the failure only appears in production.
-		if _, err := BuildMessage(metric.Tag, metric.Data, false); err != nil {
+		if _, err := BuildMessage(metric.Tag, metric.Data, metric.Compress); err != nil {
 			t.Errorf("metric %q could not be built into a message: %v", metric.Tag, err)
 		}
+	}
+}
+
+// TestDiskFreeIsCompressed pins the compression policy. diskfree is the only
+// payload whose length grows with the host, so it is the only one compressed.
+// Compressing the fixed-size payloads would gain a handful of bytes at best and
+// would make hosthealth larger.
+func TestDiskFreeIsCompressed(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("collectors are darwin specific")
+	}
+
+	metrics, _ := CollectSystemMetrics()
+	if len(metrics) == 0 {
+		t.Fatal("no metrics collected")
+	}
+
+	for _, metric := range metrics {
+		want := metric.Tag == TagDiskFree
+		if metric.Compress != want {
+			t.Errorf("metric %q compress = %v, want %v", metric.Tag, metric.Compress, want)
+		}
+	}
+}
+
+// TestCompressedPayloadRoundTrips confirms a compressed multi-volume payload
+// survives the wire encoding, since compression is the path diskfree now takes
+// on a real instance with more than one volume.
+func TestCompressedPayloadRoundTrips(t *testing.T) {
+	usage := []VolumeUsage{
+		{Mount: dataVolumePath, FreePercent: 14.52, FreeBytes: 71801593856, TotalBytes: 494384795648},
+		{Mount: "/Volumes/ephemeral0", FreePercent: 62.10, FreeBytes: 1234567890123, TotalBytes: 1987654321098},
+		{Mount: "/Volumes/InternalDisk", FreePercent: 41.98, FreeBytes: 987654321098, TotalBytes: 2345678901234},
+	}
+
+	data, err := encodeMetric(usage)
+	if err != nil {
+		t.Fatalf("encodeMetric() error = %v", err)
+	}
+
+	compressed, err := BuildMessage(TagDiskFree, data, true)
+	if err != nil {
+		t.Fatalf("BuildMessage(compressed) error = %v", err)
+	}
+	plain, err := BuildMessage(TagDiskFree, data, false)
+	if err != nil {
+		t.Fatalf("BuildMessage(plain) error = %v", err)
+	}
+
+	// Guard the premise of the compression policy rather than a fixed size: if
+	// compression ever stops paying off at three volumes, the policy is wrong.
+	if len(compressed) >= len(plain) {
+		t.Errorf("compressed message (%d bytes) is not smaller than plain (%d bytes)", len(compressed), len(plain))
 	}
 }

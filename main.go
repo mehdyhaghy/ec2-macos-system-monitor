@@ -140,7 +140,7 @@ func main() {
 				// path exits on write failure, but doing that here would mean a
 				// transient socket error takes down CPU reporting as well, and
 				// the next interval is only five minutes away.
-				written, err := ec2sm.SendMessage(metric.Tag, metric.Data, false)
+				written, err := ec2sm.SendMessage(metric.Tag, metric.Data, metric.Compress)
 				if err != nil {
 					logger.Errorf("Unable to write %s message to relay: %s\n", metric.Tag, err)
 					continue

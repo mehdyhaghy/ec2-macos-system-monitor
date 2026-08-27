@@ -386,6 +386,27 @@ func encodeMetric(v interface{}) (string, error) {
 type SystemMetric struct {
 	Tag  string
 	Data string
+	// Compress requests zlib compression of the payload on the wire.
+	//
+	// This is set per metric rather than globally because compression only pays
+	// off above a few hundred bytes: zlib output is base64 encoded to keep the
+	// serial payload to safe characters, and that overhead exceeds the saving
+	// on a small fixed-size payload. Measured message sizes:
+	//
+	//	diskfree, 1 volume     234 plain    235 compressed
+	//	diskfree, 2 volumes    378 plain    258 compressed
+	//	diskfree, 3 volumes    524 plain    275 compressed
+	//	diskfree, 4 volumes    667 plain    282 compressed
+	//	memutil                250 plain    234 compressed
+	//	thermal                165 plain    162 compressed
+	//	hosthealth             199 plain    205 compressed
+	//
+	// So only diskfree is compressed. It is the one payload whose length grows
+	// with the host, and an EC2 Mac instance normally has the data volume plus
+	// at least one instance SSD volume, which puts it past the crossover. The
+	// fixed-size payloads stay uncompressed because the saving is in the noise
+	// and hosthealth would actually get larger.
+	Compress bool
 }
 
 // CollectSystemMetrics gathers the interval metrics and returns those that
@@ -400,7 +421,7 @@ func CollectSystemMetrics() (metrics []SystemMetric, errs []error) {
 	} else if data, encErr := encodeMetric(usage); encErr != nil {
 		errs = append(errs, encErr)
 	} else {
-		metrics = append(metrics, SystemMetric{Tag: TagDiskFree, Data: data})
+		metrics = append(metrics, SystemMetric{Tag: TagDiskFree, Data: data, Compress: true})
 	}
 
 	if usage, err := MemoryUtilization(); err != nil {

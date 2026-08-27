@@ -21,6 +21,12 @@ and is forwarded to CloudWatch for the instance automatically.
 `cpuutil` is a bare decimal string. The remaining tags carry a JSON object, or a
 JSON array in the case of `diskfree`, which reports one entry per volume.
 
+`diskfree` is sent compressed because it is the only payload whose length grows
+with the host, and an instance normally has the data volume plus at least one
+instance SSD volume. At two volumes compression takes the message from 378 to
+258 bytes, and at four from 667 to 282. The other payloads are a fixed size
+where compression gains a few bytes at best, so they are sent uncompressed.
+
 Collection is partial-tolerant: a metric that cannot be gathered is logged and
 skipped so that a single unavailable source does not suppress the others.
 
