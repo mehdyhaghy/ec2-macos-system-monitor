@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/shirou/gopsutil/cpu"
+	"github.com/shirou/gopsutil/v4/cpu"
 )
 
 // RunningCpuUsage gathers the value expected for CloudWatch but allows long running measurement. This is intended for
