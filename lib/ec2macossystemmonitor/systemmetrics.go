@@ -34,14 +34,9 @@ const (
 
 // dataVolumePath is the writable APFS data volume on macOS 10.15 and later.
 //
-// On macOS Tahoe running from an Apple Silicon Mac metal instance, "/" is a
-// sealed, read-only APFS system snapshot. Reporting capacity for "/" is
-// actively misleading: the system snapshot and the data volume share one APFS
-// container, so they report identical free bytes but wildly different used
-// percentages. Measured on macOS 26.6.2, "/" reported 15% used while the data
-// volume that actually fills reported 84% used. Because the customer-visible
-// failure this metric exists to catch is a full root EBS volume leading to a
-// kernel panic, the data volume is the only correct target.
+// "/" is not measured. It is a sealed read-only system snapshot sharing an APFS
+// container with the data volume, so it reports the same free bytes but a used
+// percentage that does not track the volume that actually fills.
 const dataVolumePath = "/System/Volumes/Data"
 
 // instanceVolumePrefixes are the volume names used for the internal SSD
@@ -161,24 +156,10 @@ func thermalLabel(level uint64) string {
 // notification system, which is the same source powermetrics reports and is
 // readable without root.
 //
-// Compatibility across instance families was the deciding factor in choosing
-// this source. The notification name is the SDK constant
+// The notification name is the SDK constant
 // kOSThermalNotificationPressureLevelName, exported with an availability of
 // macOS 10.10, so the Intel mac1.metal generation and every Apple Silicon
-// generation resolve the same public symbol with the same level enum. The
-// alternatives are all narrower:
-//
-//   - SMC temperature keys differ per chip generation, requiring a distinct key
-//     table for M1, M2, M3 and M4, which does not survive a new generation.
-//   - "thermal levels" and "pmset -g thermlog" are Intel era interfaces. On
-//     Apple Silicon the former reports itself unsupported and the latter
-//     records nothing.
-//   - ProcessInfo.thermalState is portable but coarser on Apple Silicon, where
-//     it collapses the moderate and heavy levels into a single "fair" value.
-//     That makes it unable to distinguish a warm instance from one that is
-//     actually throttling, which is the whole point of the metric.
-//   - OSThermalNotificationCurrentLevel is marked __MAC_NA and is therefore not
-//     available on macOS at all.
+// generation resolve the same public symbol with the same level enum.
 func ThermalState() (pressure ThermalPressure, err error) {
 	level, err := readThermalPressureLevel()
 	if err != nil {
@@ -407,24 +388,10 @@ type SystemMetric struct {
 	Data string
 	// Compress requests zlib compression of the payload on the wire.
 	//
-	// This is set per metric rather than globally because compression only pays
-	// off above a few hundred bytes: zlib output is base64 encoded to keep the
-	// serial payload to safe characters, and that overhead exceeds the saving
-	// on a small fixed-size payload. Measured message sizes:
-	//
-	//	diskfree, 1 volume     234 plain    235 compressed
-	//	diskfree, 2 volumes    378 plain    258 compressed
-	//	diskfree, 3 volumes    524 plain    275 compressed
-	//	diskfree, 4 volumes    667 plain    282 compressed
-	//	memutil                250 plain    234 compressed
-	//	thermal                165 plain    162 compressed
-	//	hosthealth             199 plain    205 compressed
-	//
-	// So only diskfree is compressed. It is the one payload whose length grows
-	// with the host, and an EC2 Mac instance normally has the data volume plus
-	// at least one instance SSD volume, which puts it past the crossover. The
-	// fixed-size payloads stay uncompressed because the saving is in the noise
-	// and hosthealth would actually get larger.
+	// Only diskfree sets this. It is the one payload whose length grows with
+	// the host, since it carries an entry per volume. The fixed-size payloads
+	// are small enough that the base64 encoding applied to compressed data
+	// cancels out the saving.
 	Compress bool
 }
 

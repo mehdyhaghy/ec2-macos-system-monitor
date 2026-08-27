@@ -12,57 +12,21 @@ and is forwarded to CloudWatch for the instance automatically.
 | Tag | Interval | Contents |
 |---|---|---|
 | `cpuutil` | 60s | Total CPU utilization as a percentage |
-| `diskfree` | 300s | Per-volume free space and capacity |
+| `diskfree` | 300s | Free space and capacity per volume |
 | `memutil` | 300s | Physical memory use and macOS memory pressure level |
 | `swaputil` | 300s | Swap use |
-| `thermal` | 300s | Thermal pressure level and a throttling flag |
+| `thermal` | 300s | Thermal pressure level (`nominal`, `moderate`, `heavy`, `trapping`, `sleeping`) and a throttling flag, true from `heavy` upward |
 | `hosthealth` | 300s | Uptime, boot time and panic report count |
 
 `cpuutil` is a bare decimal string. The remaining tags carry a JSON object, or a
 JSON array in the case of `diskfree`, which reports one entry per volume.
-
-`diskfree` is sent compressed because it is the only payload whose length grows
-with the host, and an instance normally has the data volume plus at least one
-instance SSD volume. At two volumes compression takes the message from 378 to
-258 bytes, and at four from 667 to 282. The other payloads are a fixed size
-where compression gains a few bytes at best, so they are sent uncompressed.
+`diskfree` is sent compressed.
 
 Collection is partial-tolerant: a metric that cannot be gathered is logged and
 skipped so that a single unavailable source does not suppress the others.
 
-### Volumes measured by `diskfree`
-
-On macOS 10.15 and later, `/` is a sealed read-only APFS system snapshot that
-shares an APFS container with the writable data volume. The two report identical
-free bytes but very different used percentages, so `/` is misleading as a
-capacity signal: on a macOS Tahoe host measured during development, `/` reported
-15% used while the data volume that actually fills reported 84% used.
-
-`diskfree` therefore measures `/System/Volumes/Data` plus any volume under
-`/Volumes` whose name begins with `ephemeral` or `InternalDisk`, which are the
-names used for the internal SSD on EC2 Mac instances. Read-only volumes and
-other entries under `/Volumes`, such as mounted disk images, are skipped to keep
-the CloudWatch dimension cardinality bounded.
-
-### Alarming on `diskfree`
-
-Five minutes is loose for free space, because a runaway build can consume the
-remaining headroom on a small root volume inside a single interval. Alarm with
-margin, in the range of 20 to 25 percent free rather than 10, so that one missed
-interval does not become a kernel panic.
-
-### Thermal pressure source
-
-`thermal` reads the level that `thermald` publishes to the Darwin notification
-system, using the `kOSThermalNotificationPressureLevelName` constant from
-`<libkern/OSThermalNotification.h>`. That symbol is available from macOS 10.10,
-so the same code path works on Intel and on every Apple Silicon generation. The
-level is reported as `nominal`, `moderate`, `heavy`, `trapping` or `sleeping`,
-and `throttling` is true from `heavy` upward, which is the point at which clocks
-are actually being reduced.
-
-Reading this level requires cgo, which the build already enables. With cgo
-disabled the agent still builds and reports every other metric.
+`thermal` requires cgo, which the build already enables. With cgo disabled the
+agent still builds and reports every other metric.
 
 ## Usage
 The agent is installed and enabled by default for all AMIs vended by AWS. It logs to 
