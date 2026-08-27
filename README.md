@@ -22,11 +22,28 @@ and is forwarded to CloudWatch for the instance automatically.
 JSON array in the case of `diskfree`, which reports one entry per volume.
 `diskfree` is sent compressed.
 
-Collection is partial-tolerant: a metric that cannot be gathered is logged and
-skipped so that a single unavailable source does not suppress the others.
-
 `thermal` requires cgo, which the build already enables. With cgo disabled the
 agent still builds and reports every other metric.
+
+### Alarming
+
+Five minutes is loose for `diskfree`, because a runaway build can consume the
+remaining headroom on a small root volume inside a single interval. Alarm with
+margin, in the range of 20 to 25 percent free rather than 10, so that one missed
+interval does not become a kernel panic.
+
+Alarm `memutil` on `pressure_level`, not `used_pct`. macOS holds memory for
+caching and compression, so a high used percentage is normal on a healthy
+instance and is not actionable on its own. `pressure_level` is the kernel's own
+assessment: `1` is normal, `2` is warning and `4` is critical, reported in
+`pressure_label` as `normal`, `warning` and `critical`. Rising `swaputil`
+alongside a warning level confirms real memory exhaustion rather than ordinary
+caching.
+
+### Collection
+
+Collection is partial-tolerant: a metric that cannot be gathered is logged and
+skipped so that a single unavailable source does not suppress the others.
 
 ## Usage
 The agent is installed and enabled by default for all AMIs vended by AWS. It logs to 
