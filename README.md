@@ -61,13 +61,6 @@ level is reported as `nominal`, `moderate`, `heavy`, `trapping` or `sleeping`,
 and `throttling` is true from `heavy` upward, which is the point at which clocks
 are actually being reduced.
 
-This source was chosen over the alternatives for portability. SMC temperature
-keys differ per chip generation. `thermal levels` and `pmset -g thermlog` are
-Intel era interfaces that report nothing on Apple Silicon.
-`ProcessInfo.thermalState` is portable but collapses `moderate` and `heavy` into
-a single `fair` value on Apple Silicon, which cannot distinguish a warm instance
-from a throttling one.
-
 Reading this level requires cgo, which the build already enables. With cgo
 disabled the agent still builds and reports every other metric.
 
