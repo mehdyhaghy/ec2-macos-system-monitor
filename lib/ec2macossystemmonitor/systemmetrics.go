@@ -7,10 +7,11 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/shirou/gopsutil/v4/disk"
-	"github.com/shirou/gopsutil/v4/host"
 	"github.com/shirou/gopsutil/v4/mem"
+	"golang.org/x/sys/unix"
 )
 
 // Metric tags namespace each payload on the serial device. The receiving end of
@@ -349,23 +350,41 @@ func panicReportCount() (count int, readable bool) {
 	return count, true
 }
 
-// HostHealthStatus gathers uptime and unexpected reboot evidence.
-func HostHealthStatus() (health HostHealth, err error) {
-	uptime, err := host.Uptime()
+// bootTimeSysctl reports the kernel boot time. Reading it directly avoids
+// pulling in gopsutil's host package, which transitively compiles in its
+// process and net packages for information this agent does not report.
+const bootTimeSysctl = "kern.boottime"
+
+// hostBootTime returns the kernel boot time.
+func hostBootTime() (bootTime time.Time, err error) {
+	tv, err := unix.SysctlTimeval(bootTimeSysctl)
 	if err != nil {
-		return HostHealth{}, fmt.Errorf("ec2macossystemmonitor: error while getting uptime: %w", err)
+		return time.Time{}, fmt.Errorf("ec2macossystemmonitor: error while reading %s: %w", bootTimeSysctl, err)
 	}
 
-	bootTime, err := host.BootTime()
+	return time.Unix(tv.Sec, int64(tv.Usec)*int64(time.Microsecond)), nil
+}
+
+// HostHealthStatus gathers uptime and unexpected reboot evidence.
+func HostHealthStatus() (health HostHealth, err error) {
+	bootTime, err := hostBootTime()
 	if err != nil {
-		return HostHealth{}, fmt.Errorf("ec2macossystemmonitor: error while getting boot time: %w", err)
+		return HostHealth{}, err
+	}
+
+	// Clamp rather than report a negative duration. A boot time in the future
+	// means the clock was stepped backwards, which is not something this metric
+	// can describe, and an unsigned field cannot carry it.
+	uptime := time.Since(bootTime)
+	if uptime < 0 {
+		uptime = 0
 	}
 
 	count, readable := panicReportCount()
 
 	return HostHealth{
-		UptimeSeconds: uptime,
-		BootTime:      bootTime,
+		UptimeSeconds: uint64(uptime.Seconds()),
+		BootTime:      uint64(bootTime.Unix()),
 		PanicCount:    count,
 		PanicReadable: readable,
 	}, nil
