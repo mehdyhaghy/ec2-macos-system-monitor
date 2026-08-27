@@ -1,0 +1,439 @@
+package ec2macossystemmonitor
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+
+	"github.com/shirou/gopsutil/v4/disk"
+	"github.com/shirou/gopsutil/v4/host"
+	"github.com/shirou/gopsutil/v4/mem"
+)
+
+// Metric tags namespace each payload on the serial device. The receiving end of
+// the serial relay must recognize a tag before the data reaches CloudWatch, so
+// these values are part of the wire contract and must not be renamed.
+const (
+	// TagCPUUtilization carries total CPU utilization as a percentage.
+	TagCPUUtilization = "cpuutil"
+	// TagDiskFree carries per-volume free space.
+	TagDiskFree = "diskfree"
+	// TagMemoryUtilization carries physical memory use and macOS memory pressure.
+	TagMemoryUtilization = "memutil"
+	// TagSwapUtilization carries swap use.
+	TagSwapUtilization = "swaputil"
+	// TagThermal carries the system thermal pressure state.
+	TagThermal = "thermal"
+	// TagHostHealth carries uptime and unexpected-reboot evidence.
+	TagHostHealth = "hosthealth"
+)
+
+// dataVolumePath is the writable APFS data volume on macOS 10.15 and later.
+//
+// On macOS Tahoe running from an Apple Silicon Mac metal instance, "/" is a
+// sealed, read-only APFS system snapshot. Reporting capacity for "/" is
+// actively misleading: the system snapshot and the data volume share one APFS
+// container, so they report identical free bytes but wildly different used
+// percentages. Measured on macOS 26.6.2, "/" reported 15% used while the data
+// volume that actually fills reported 84% used. Because the customer-visible
+// failure this metric exists to catch is a full root EBS volume leading to a
+// kernel panic, the data volume is the only correct target.
+const dataVolumePath = "/System/Volumes/Data"
+
+// instanceVolumePrefixes are the volume names used for the internal SSD
+// attached to EC2 Mac metal instances. Apple Silicon instance families expose
+// the internal disk as /Volumes/InternalDisk and its provisioned partitions as
+// /Volumes/ephemeral0 and similar. Other entries under /Volumes, such as
+// mounted disk images or network shares, are ignored on purpose to keep the
+// CloudWatch dimension cardinality bounded and predictable.
+var instanceVolumePrefixes = []string{"ephemeral", "InternalDisk"}
+
+// diagnosticReportsPath holds macOS panic reports. A launchd daemon running as
+// root can normally read this directory, but Tahoe tightened Full Disk Access
+// for daemons, so every read here must degrade gracefully rather than fail the
+// collection cycle.
+const diagnosticReportsPath = "/Library/Logs/DiagnosticReports"
+
+// vmPressureSysctl exposes the macOS memory pressure level. This sysctl is
+// present on Apple Silicon under Tahoe and is the supported way to read
+// pressure without spawning the memory_pressure binary.
+const vmPressureSysctl = "kern.memorystatus_vm_pressure_level"
+
+// macOS memory pressure levels as reported by vmPressureSysctl. The kernel uses
+// a sparse bitmask rather than sequential values, so 3 is not a valid level.
+const (
+	memoryPressureNormal   = 1
+	memoryPressureWarning  = 2
+	memoryPressureCritical = 4
+)
+
+// VolumeUsage describes free space for a single mounted volume. FreePercent is
+// the value to alarm on, and Mount becomes the CloudWatch dimension.
+type VolumeUsage struct {
+	Mount       string  `json:"mount"`
+	FreePercent float64 `json:"free_pct"`
+	FreeBytes   uint64  `json:"free_bytes"`
+	TotalBytes  uint64  `json:"total_bytes"`
+}
+
+// MemoryUsage describes physical memory use plus the macOS pressure level.
+// PressureLevel is more actionable than UsedPercent on macOS, because the
+// kernel reports high memory use as normal while it still has compressible
+// pages available.
+type MemoryUsage struct {
+	UsedPercent   float64 `json:"used_pct"`
+	AvailBytes    uint64  `json:"avail_bytes"`
+	TotalBytes    uint64  `json:"total_bytes"`
+	PressureLevel uint32  `json:"pressure_level"`
+	PressureLabel string  `json:"pressure_label"`
+}
+
+// SwapUsage describes swap use. Sustained swap growth on a build fleet is an
+// early indicator of memory exhaustion that CPU utilization does not surface.
+type SwapUsage struct {
+	UsedPercent float64 `json:"used_pct"`
+	UsedBytes   uint64  `json:"used_bytes"`
+	FreeBytes   uint64  `json:"free_bytes"`
+	TotalBytes  uint64  `json:"total_bytes"`
+}
+
+// HostHealth describes uptime and evidence of unexpected reboots. Uptime alone
+// detects a reboot because the counter resets, which makes this payload useful
+// even when PanicReadable is false.
+type HostHealth struct {
+	UptimeSeconds uint64 `json:"uptime_seconds"`
+	BootTime      uint64 `json:"boot_time"`
+	PanicCount    int    `json:"panic_count"`
+	PanicReadable bool   `json:"panic_readable"`
+}
+
+// macOS thermal pressure levels as published by thermald, matching the
+// TARGET_OS_OSX branch of kOSThermalPressureLevel in
+// /usr/include/libkern/OSThermalNotification.h. Verified against the macOS
+// Tahoe SDK. Note that the non-macOS branch of that enum uses a different,
+// sparse numbering, so these values must not be reused for other platforms.
+const (
+	thermalNominal   = 0
+	thermalModerate  = 1
+	thermalHeavy     = 2
+	thermalTrapping  = 3
+	thermalSleeping  = 4
+	thermalThrottled = thermalHeavy
+)
+
+// ThermalPressure describes the system thermal pressure state.
+//
+// Throttling is the field to alarm on. It is true from the heavy level upward,
+// which is the point at which the SoC is actually reducing clocks rather than
+// merely running warm. Reporting the boundary here rather than leaving it to
+// the consumer keeps the alarm definition from drifting away from the enum.
+type ThermalPressure struct {
+	Level      uint64 `json:"level"`
+	LevelLabel string `json:"level_label"`
+	Throttling bool   `json:"throttling"`
+}
+
+// thermalLabel maps a macOS thermal pressure level to a readable label.
+func thermalLabel(level uint64) string {
+	switch level {
+	case thermalNominal:
+		return "nominal"
+	case thermalModerate:
+		return "moderate"
+	case thermalHeavy:
+		return "heavy"
+	case thermalTrapping:
+		return "trapping"
+	case thermalSleeping:
+		return "sleeping"
+	default:
+		return "unknown"
+	}
+}
+
+// ThermalState gathers the current system thermal pressure.
+//
+// This reads the thermal pressure level that thermald publishes to the Darwin
+// notification system, which is the same source powermetrics reports and is
+// readable without root.
+//
+// Compatibility across instance families was the deciding factor in choosing
+// this source. The notification name is the SDK constant
+// kOSThermalNotificationPressureLevelName, exported with an availability of
+// macOS 10.10, so the Intel mac1.metal generation and every Apple Silicon
+// generation resolve the same public symbol with the same level enum. The
+// alternatives are all narrower:
+//
+//   - SMC temperature keys differ per chip generation, requiring a distinct key
+//     table for M1, M2, M3 and M4, which does not survive a new generation.
+//   - "thermal levels" and "pmset -g thermlog" are Intel era interfaces. On
+//     Apple Silicon the former reports itself unsupported and the latter
+//     records nothing.
+//   - ProcessInfo.thermalState is portable but coarser on Apple Silicon, where
+//     it collapses the moderate and heavy levels into a single "fair" value.
+//     That makes it unable to distinguish a warm instance from one that is
+//     actually throttling, which is the whole point of the metric.
+//   - OSThermalNotificationCurrentLevel is marked __MAC_NA and is therefore not
+//     available on macOS at all.
+func ThermalState() (pressure ThermalPressure, err error) {
+	level, err := readThermalPressureLevel()
+	if err != nil {
+		return ThermalPressure{}, err
+	}
+
+	return ThermalPressure{
+		Level:      level,
+		LevelLabel: thermalLabel(level),
+		Throttling: level >= thermalThrottled,
+	}, nil
+}
+
+// pressureLabel maps a macOS memory pressure level to a readable label.
+func pressureLabel(level uint32) string {
+	switch level {
+	case memoryPressureNormal:
+		return "normal"
+	case memoryPressureWarning:
+		return "warning"
+	case memoryPressureCritical:
+		return "critical"
+	default:
+		return "unknown"
+	}
+}
+
+// isMonitoredVolume reports whether a mount point should be measured.
+//
+// The data volume is always measured. Entries under /Volumes are measured only
+// when they match a known EC2 Mac internal disk name, which excludes mounted
+// installers and disk images that would otherwise churn the dimension set.
+func isMonitoredVolume(mountPoint string) bool {
+	if mountPoint == dataVolumePath {
+		return true
+	}
+
+	name, found := strings.CutPrefix(mountPoint, "/Volumes/")
+	if !found {
+		return false
+	}
+
+	for _, prefix := range instanceVolumePrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isReadOnly reports whether a partition is mounted read-only. The sealed
+// system volume on Tahoe is read-only and is skipped by this check even if it
+// somehow passes the mount point filter.
+func isReadOnly(opts []string) bool {
+	for _, opt := range opts {
+		if opt == "ro" {
+			return true
+		}
+	}
+
+	return false
+}
+
+// DiskUsage gathers free space for the volumes that can fill on an EC2 Mac
+// instance. It returns at least one entry on success.
+//
+// A failure to stat a single volume is not fatal: a volume can be unmounted
+// between enumeration and measurement, and losing one volume is preferable to
+// losing the whole collection cycle. An error is returned only when no volume
+// could be measured at all.
+func DiskUsage() (usage []VolumeUsage, err error) {
+	partitions, err := disk.Partitions(false)
+	if err != nil {
+		return nil, fmt.Errorf("ec2macossystemmonitor: error while listing partitions: %w", err)
+	}
+
+	for _, partition := range partitions {
+		if !isMonitoredVolume(partition.Mountpoint) || isReadOnly(partition.Opts) {
+			continue
+		}
+
+		stat, statErr := disk.Usage(partition.Mountpoint)
+		if statErr != nil || stat == nil || stat.Total == 0 {
+			continue
+		}
+
+		usage = append(usage, VolumeUsage{
+			Mount:       partition.Mountpoint,
+			FreePercent: 100 - stat.UsedPercent,
+			FreeBytes:   stat.Free,
+			TotalBytes:  stat.Total,
+		})
+	}
+
+	if len(usage) == 0 {
+		return nil, fmt.Errorf("ec2macossystemmonitor: no monitored volumes could be measured")
+	}
+
+	return usage, nil
+}
+
+// MemoryUtilization gathers physical memory use and the macOS memory pressure
+// level.
+//
+// A missing pressure sysctl is not fatal. The used percentage still has value
+// on its own, so the pressure level falls back to an unknown label rather than
+// failing the whole metric.
+func MemoryUtilization() (usage MemoryUsage, err error) {
+	virtual, err := mem.VirtualMemory()
+	if err != nil {
+		return MemoryUsage{}, fmt.Errorf("ec2macossystemmonitor: error while getting memory stats: %w", err)
+	}
+
+	usage = MemoryUsage{
+		UsedPercent: virtual.UsedPercent,
+		AvailBytes:  virtual.Available,
+		TotalBytes:  virtual.Total,
+	}
+
+	level, sysctlErr := syscall.SysctlUint32(vmPressureSysctl)
+	if sysctlErr != nil {
+		usage.PressureLabel = pressureLabel(0)
+		return usage, nil
+	}
+
+	usage.PressureLevel = level
+	usage.PressureLabel = pressureLabel(level)
+
+	return usage, nil
+}
+
+// SwapUtilization gathers swap use from the kernel. On Apple Silicon this reads
+// the vm.swapusage sysctl, which remains available under Tahoe.
+func SwapUtilization() (usage SwapUsage, err error) {
+	swap, err := mem.SwapMemory()
+	if err != nil {
+		return SwapUsage{}, fmt.Errorf("ec2macossystemmonitor: error while getting swap stats: %w", err)
+	}
+
+	return SwapUsage{
+		UsedPercent: swap.UsedPercent,
+		UsedBytes:   swap.Used,
+		FreeBytes:   swap.Free,
+		TotalBytes:  swap.Total,
+	}, nil
+}
+
+// panicReportCount counts macOS panic reports on disk.
+//
+// The boolean return reports whether the directory could be read at all, which
+// distinguishes a genuinely healthy host with zero panics from a host where the
+// daemon lacks the access needed to look.
+func panicReportCount() (count int, readable bool) {
+	entries, err := os.ReadDir(diagnosticReportsPath)
+	if err != nil {
+		return 0, false
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		if strings.EqualFold(filepath.Ext(entry.Name()), ".panic") {
+			count++
+		}
+	}
+
+	return count, true
+}
+
+// HostHealthStatus gathers uptime and unexpected reboot evidence.
+func HostHealthStatus() (health HostHealth, err error) {
+	uptime, err := host.Uptime()
+	if err != nil {
+		return HostHealth{}, fmt.Errorf("ec2macossystemmonitor: error while getting uptime: %w", err)
+	}
+
+	bootTime, err := host.BootTime()
+	if err != nil {
+		return HostHealth{}, fmt.Errorf("ec2macossystemmonitor: error while getting boot time: %w", err)
+	}
+
+	count, readable := panicReportCount()
+
+	return HostHealth{
+		UptimeSeconds: uptime,
+		BootTime:      bootTime,
+		PanicCount:    count,
+		PanicReadable: readable,
+	}, nil
+}
+
+// encodeMetric marshals a metric payload to the compact JSON string carried in
+// the data field of a serial payload.
+func encodeMetric(v interface{}) (string, error) {
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return "", fmt.Errorf("ec2macossystemmonitor: error while encoding metric: %w", err)
+	}
+
+	return string(encoded), nil
+}
+
+// SystemMetric pairs a wire tag with its encoded payload.
+type SystemMetric struct {
+	Tag  string
+	Data string
+}
+
+// CollectSystemMetrics gathers the interval metrics and returns those that
+// succeeded along with the errors for those that did not.
+//
+// Collection is deliberately partial-tolerant. A single unavailable metric,
+// such as thermal state on a host where the framework call is unsupported,
+// must not suppress the disk metric that exists to prevent a kernel panic.
+func CollectSystemMetrics() (metrics []SystemMetric, errs []error) {
+	if usage, err := DiskUsage(); err != nil {
+		errs = append(errs, err)
+	} else if data, encErr := encodeMetric(usage); encErr != nil {
+		errs = append(errs, encErr)
+	} else {
+		metrics = append(metrics, SystemMetric{Tag: TagDiskFree, Data: data})
+	}
+
+	if usage, err := MemoryUtilization(); err != nil {
+		errs = append(errs, err)
+	} else if data, encErr := encodeMetric(usage); encErr != nil {
+		errs = append(errs, encErr)
+	} else {
+		metrics = append(metrics, SystemMetric{Tag: TagMemoryUtilization, Data: data})
+	}
+
+	if usage, err := SwapUtilization(); err != nil {
+		errs = append(errs, err)
+	} else if data, encErr := encodeMetric(usage); encErr != nil {
+		errs = append(errs, encErr)
+	} else {
+		metrics = append(metrics, SystemMetric{Tag: TagSwapUtilization, Data: data})
+	}
+
+	if state, err := ThermalState(); err != nil {
+		errs = append(errs, err)
+	} else if data, encErr := encodeMetric(state); encErr != nil {
+		errs = append(errs, encErr)
+	} else {
+		metrics = append(metrics, SystemMetric{Tag: TagThermal, Data: data})
+	}
+
+	if health, err := HostHealthStatus(); err != nil {
+		errs = append(errs, err)
+	} else if data, encErr := encodeMetric(health); encErr != nil {
+		errs = append(errs, encErr)
+	} else {
+		metrics = append(metrics, SystemMetric{Tag: TagHostHealth, Data: data})
+	}
+
+	return metrics, errs
+}
